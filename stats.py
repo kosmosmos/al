@@ -31,7 +31,7 @@ from telethon.tl.types import (
 logging.basicConfig(level=logging.DEBUG)
 api_id = '25965226'
 api_hash = '7a1c735626be2bbb5b0898d66a47e15d'
-bot_token = '7444376874:AAFg4BH-Kv5qQKFkPIhhGnEgJtsAM-sIv20'
+bot_token = '7341467722:AAENUe6Mnn23oJgRjoqQ56M2ZpXl6A0UUzw'
 
 client = TelegramClient('bot', api_id, api_hash)
 sentiment_analyzer = pipeline('sentiment-analysis', model='nlptown/bert-base-multilingual-uncased-sentiment')
@@ -107,8 +107,10 @@ async def init_db():
     ''')
     await db.execute('''
         CREATE TABLE IF NOT EXISTS emojis (
-            emoji TEXT PRIMARY KEY,
-            count INTEGER DEFAULT 0
+            emoji TEXT,
+            group_id INTEGER,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY (emoji, group_id)
         )
     ''')
     await db.execute('''
@@ -284,27 +286,14 @@ async def init_db():
         )
     ''')
     await db.execute('''
-    CREATE TABLE IF NOT EXISTS video_selfies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        group_id INTEGER,
-        size INTEGER,
-        duration INTEGER
-    )
-''')
-    await db.execute('''
-        CREATE TABLE IF NOT EXISTS video_sizes (
+        CREATE TABLE IF NOT EXISTS video_selfies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             group_id INTEGER,
             size INTEGER,
-            duration INTEGER,
-            is_selfie INTEGER DEFAULT 0
+            duration INTEGER
         )
     ''')
-
-
-
 
     await db.execute('CREATE INDEX IF NOT EXISTS idx_engagement_user_group_period ON engagement (user_id, group_id, period)')
     await db.execute('CREATE INDEX IF NOT EXISTS idx_hourly_engagement_user_group_hour ON hourly_engagement (user_id, group_id, hour)')
@@ -586,14 +575,15 @@ async def update_mention(user_id, group_id, mention):
     ''', (user_id, group_id, mention))
     await db.commit()
 
-async def update_emoji(emoji):
+async def update_emoji(emoji, group_id):
     await db.execute('''
-        INSERT INTO emojis (emoji, count)
-        VALUES (?, 1)
-        ON CONFLICT(emoji) DO UPDATE SET
+        INSERT INTO emojis (emoji, group_id, count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(emoji, group_id) DO UPDATE SET
         count = count + 1
-    ''', (emoji,))
+    ''', (emoji, group_id))
     await db.commit()
+
 
 @client.on(events.InlineQuery)
 async def inline_query_handler(event):
@@ -846,7 +836,7 @@ async def process_message_content(event, message_text, user_id, group_id):
         emojis = emoji_pattern.findall(message_text)
         for emoji in emojis:
             for individual_emoji in list(emoji):
-                await update_emoji(individual_emoji)
+                await update_emoji(individual_emoji, group_id)
 
     if event.message.is_reply:
         await update_participation(user_id, group_id, 0, 0, 0, 1)
@@ -1664,7 +1654,7 @@ async def get_media_type_distribution(group_id):
     async with db.execute('''
         SELECT media_type, SUM(count) as total_count 
         FROM media_usage 
-        WHERE user_id IN (SELECT DISTINCT user_id FROM messages WHERE group_id = ?)
+        WHERE group_id = ?
         GROUP BY media_type
     ''', (group_id,)) as cursor:
         rows = await cursor.fetchall()
@@ -1673,8 +1663,9 @@ async def get_media_type_distribution(group_id):
     for media_type, total_count in rows:
         result += f"{media_type.capitalize()}: {total_count} uses\n"
 
-
     return result if rows else "No media usage data available."
+
+
 
 async def get_total_link_count():
     async with db.execute('SELECT COUNT(*) FROM links') as cursor:
@@ -1838,11 +1829,11 @@ async def format_media_stats(group_id, media_type):
     return result
 
 async def format_emoji_stats(group_id):
-    async with db.execute('SELECT emoji, count FROM emojis ORDER BY count DESC LIMIT 10') as cursor:
+    async with db.execute('SELECT emoji, count FROM emojis WHERE group_id = ? ORDER BY count DESC LIMIT 10', (group_id,)) as cursor:
         rows = await cursor.fetchall()
-    result = "**Emoji Stats (Top 10 Emojis):**\n"
+    result = "😊 **Emoji Stats (Top 10 Emojis)** 😊\n"
     for emoji, count in rows:
-        result += f" - {emoji}: {count} times\n"
+        result += f"{emoji}: {count} times\n"
     return result
 
 async def format_forward_stats(group_id):
