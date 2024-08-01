@@ -31,7 +31,7 @@ from telethon.tl.types import (
 logging.basicConfig(level=logging.DEBUG)
 api_id = '25965226'
 api_hash = '7a1c735626be2bbb5b0898d66a47e15d'
-bot_token = '7341467722:AAENUe6Mnn23oJgRjoqQ56M2ZpXl6A0UUzw'
+bot_token = '7444376874:AAFg4BH-Kv5qQKFkPIhhGnEgJtsAM-sIv20'
 
 client = TelegramClient('bot', api_id, api_hash)
 sentiment_analyzer = pipeline('sentiment-analysis', model='nlptown/bert-base-multilingual-uncased-sentiment')
