@@ -16,10 +16,8 @@ import pandas as pd
 from prophet import Prophet
 import matplotlib.pyplot as plt
 import io
-print(np.__version__)
 
 logging.basicConfig(level=logging.DEBUG)
-# Define your API ID, API Hash, and bot token
 api_id = '25965226'
 api_hash = '7a1c735626be2bbb5b0898d66a47e15d'
 bot_token = '7444376874:AAFg4BH-Kv5qQKFkPIhhGnEgJtsAM-sIv20'
@@ -29,6 +27,7 @@ sentiment_analyzer = pipeline('sentiment-analysis', model='nlptown/bert-base-mul
 db = None
 sia = None
 bot_user_id = None
+user_cache = {}
 
 async def init_bot():
     global bot_user_id
@@ -40,6 +39,7 @@ async def init_db():
     global db, sia
     db = await aiosqlite.connect('stats.db')
     
+    # Create new tables with correct schema if they do not exist
     await db.execute('''
         CREATE TABLE IF NOT EXISTS engagement (
             user_id INTEGER,
@@ -114,8 +114,6 @@ async def init_db():
             PRIMARY KEY (user_id, command)
         )
     ''')
-
-    # Create the voice_message_lengths table if it does not exist
     await db.execute('''
         CREATE TABLE IF NOT EXISTS voice_message_lengths (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,8 +121,6 @@ async def init_db():
             length INTEGER
         )
     ''')
-    
-    # Create the photo_sizes table if it does not exist
     await db.execute('''
         CREATE TABLE IF NOT EXISTS photo_sizes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,8 +130,6 @@ async def init_db():
             height INTEGER
         )
     ''')
-
-    # Create the video_sizes table if it does not exist
     await db.execute('''
         CREATE TABLE IF NOT EXISTS video_sizes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,8 +138,6 @@ async def init_db():
             duration INTEGER
         )
     ''')
-
-    # Create the mentions table if it does not exist
     await db.execute('''
         CREATE TABLE IF NOT EXISTS mentions (
             user_id INTEGER,
@@ -154,8 +146,27 @@ async def init_db():
             PRIMARY KEY (user_id, mention)
         )
     ''')
-
-
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS animated_stickers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            count INTEGER DEFAULT 0
+        )
+    ''')
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS audios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            length INTEGER,
+            size INTEGER
+        )
+    ''')
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS forwards (
+            user_id INTEGER PRIMARY KEY,
+            count INTEGER DEFAULT 0
+        )
+    ''')
     await db.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,12 +175,86 @@ async def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS link_sharing (
+            user_id INTEGER,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id)
+        )
+    ''')
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS message_deletions (
+            user_id INTEGER,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id)
+        )
+    ''')
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS message_types (
+            user_id INTEGER,
+            message_type TEXT,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, message_type)
+        )
+    ''')
     
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_engagement_user_period ON engagement (user_id, period)')
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_hourly_engagement_user_hour ON hourly_engagement (user_id, hour)')
     await db.commit()
 
-    # Initialize sentiment analysis
     nltk.download('vader_lexicon')
     sia = SentimentIntensityAnalyzer()
+
+async def batch_update_participation(updates):
+    async with db.execute('BEGIN TRANSACTION'):
+        for update in updates:
+            await db.execute('''
+                INSERT INTO participation (user_id, messages, words, characters, replies)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                messages = participation.messages + excluded.messages,
+                words = participation.words + excluded.words,
+                characters = participation.characters + excluded.characters,
+                replies = participation.replies + excluded.replies
+            ''', update)
+    await db.commit()
+
+async def get_user_entity(user_id):
+    if user_id not in user_cache:
+        user_cache[user_id] = await client.get_entity(user_id)
+    return user_cache[user_id]
+
+
+async def update_link_sharing(user_id):
+    await db.execute('''
+        INSERT INTO link_sharing (user_id, count)
+        VALUES (?, 1)
+        ON CONFLICT(user_id) DO UPDATE SET
+        count = count + 1
+    ''', (user_id,))
+    await db.commit()
+
+
+async def update_message_deletions(user_id):
+    await db.execute('''
+        INSERT INTO message_deletions (user_id, count)
+        VALUES (?, 1)
+        ON CONFLICT(user_id) DO UPDATE SET
+        count = count + 1
+    ''', (user_id,))
+    await db.commit()
+
+
+async def update_message_types(user_id, message_type):
+    await db.execute('''
+        INSERT INTO message_types (user_id, message_type, count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, message_type) DO UPDATE SET
+        count = count + 1
+    ''', (user_id, message_type))
+    await db.commit()
+
+
 
 async def update_engagement(user_id, period):
     await db.execute('''
@@ -259,6 +344,23 @@ async def update_video_size(user_id, size, duration):
     await db.commit()
     logging.debug(f"Inserted video size: user_id={user_id}, size={size}, duration={duration}")
 
+async def update_audio(user_id, length, size):
+    await db.execute('''
+        INSERT INTO audios (user_id, length, size)
+        VALUES (?, ?, ?)
+    ''', (user_id, length, size))
+    await db.commit()
+    logging.debug(f"Inserted audio: user_id={user_id}, length={length}, size={size}")
+
+async def update_forward(user_id):
+    await db.execute('''
+        INSERT INTO forwards (user_id, count)
+        VALUES (?, 1)
+        ON CONFLICT(user_id) DO UPDATE SET
+        count = count + 1
+    ''', (user_id,))
+    await db.commit()
+    logging.debug(f"Updated forward count for user_id={user_id}")
 
 async def save_message_sentiment(user_id, message_id, sentiment_score):
     logging.debug(f"Saving sentiment: user_id={user_id}, message_id={message_id}, sentiment_score={sentiment_score}")
@@ -276,7 +378,6 @@ async def save_message_sentiment(user_id, message_id, sentiment_score):
 
     await db.commit()
     logging.debug(f"Sentiment saved: user_id={user_id}, message_id={message_id}, sentiment_score={sentiment_score}")
-
 
 async def update_message_edits(user_id):
     await db.execute('''
@@ -314,14 +415,12 @@ async def update_emoji(emoji):
     ''', (emoji,))
     await db.commit()
 
-
-
-
 @client.on(events.InlineQuery)
 async def inline_query_handler(event):
     query = event.text
     if query.isdigit():
         user_id = int(query)
+        user = await get_user_entity(user_id)
         results = await asyncio.gather(
             get_user_participation(user_id),
             get_user_hourly_engagement(user_id),
@@ -341,7 +440,7 @@ async def inline_query_handler(event):
             average_sentiment = 0
 
         user_stats = f"""
-📊 **User Stats for [User {user_id}](tg://user?id={user_id})** 📊
+📊 **User Stats for [{user.first_name}](tg://user?id={user_id})({user_id})** 📊
 
 📈 **Participation:**
 {participation_stats}
@@ -374,7 +473,7 @@ async def inline_query_handler(event):
             InputBotInlineResult(
                 id='1',
                 type='article',
-                title=f"Stats for User {user_id}",
+                title=f"Stats for {user.first_name}({user_id})",
                 description="View the detailed stats",
                 send_message=InputBotInlineMessageText(user_stats)
             )
@@ -383,7 +482,6 @@ async def inline_query_handler(event):
         await event.answer(result)
     else:
         await event.answer([], switch_pm='Enter a valid user ID', switch_pm_param='start')
-
 
 @client.on(events.NewMessage(pattern='/search'))
 async def search_command_handler(event):
@@ -394,6 +492,7 @@ async def search_command_handler(event):
             return
         
         user_id = int(query[1])
+        user = await get_user_entity(user_id)
         results = await asyncio.gather(
             get_user_participation(user_id),
             get_user_hourly_engagement(user_id),
@@ -413,7 +512,7 @@ async def search_command_handler(event):
             average_sentiment = 0
 
         user_stats = f"""
-📊 **User Stats for [User {user_id}](tg://user?id={user_id})** 📊
+📊 **User Stats for [{user.first_name}](tg://user?id={user_id})({user_id})** 📊
 
 📈 **Participation:**
 {participation_stats}
@@ -467,6 +566,8 @@ emoji_pattern = re.compile(
 mention_pattern = re.compile(r'@\w+')
 
 
+
+
 @client.on(events.NewMessage(incoming=True))
 async def track_engagement(event):
     global bot_user_id
@@ -478,53 +579,31 @@ async def track_engagement(event):
     hour = datetime.now().hour
     message_text = event.message.message or ""
 
-    async def handle_message():
-        await asyncio.gather(
-            update_engagement(user_id, 'daily'),
-            update_engagement(user_id, 'weekly'),
-            update_engagement(user_id, 'monthly'),
-            update_hourly_engagement(user_id, hour)
-        )
-        await process_message_content(event, message_text, user_id)
-        await process_media_types(event, user_id)
+    await process_message(event, message_text, user_id)
 
-        # Insert the message into the messages table
-        await db.execute('''
-            INSERT INTO messages (user_id, message, timestamp)
-            VALUES (?, ?, ?)
-        ''', (user_id, message_text, datetime.now()))
-        await db.commit()
+async def process_message(event, message_text, user_id):
+    await asyncio.gather(
+        update_engagement(user_id, 'daily'),
+        update_engagement(user_id, 'weekly'),
+        update_engagement(user_id, 'monthly'),
+        update_hourly_engagement(user_id, datetime.now().hour),
+        process_message_content(event, message_text, user_id),
+        process_media_types(event, user_id),
+        update_message_types(user_id, 'text' if event.message.media is None else 'media')
+    )
 
-        # Sentiment analysis
-        stars = await analyze_sentiment(message_text)
-        sentiment_score = (stars / 5) * 100  # Convert to percentage
-        await save_message_sentiment(user_id, message_id, sentiment_score)
+    if 'http://' in message_text or 'https://' in message_text:
+        await update_link_sharing(user_id)
 
-        # Track replies, forwarded messages, links, commands, and mentions
-        if event.message.is_reply:
-            reply_to_user_id = (await event.get_reply_message()).sender_id
-            await update_participation(reply_to_user_id, 0, 0, 0, 1)
-        if event.message.fwd_from:
-            await update_engagement(user_id, 'forwarded')
-        if "http://" in message_text or "https://" in message_text:
-            await update_media_usage(user_id, 'link')
-        if message_text.startswith('/'):
-            command = message_text.split()[0]
-            await update_commands(user_id, command)
-        mentions = mention_pattern.findall(message_text)
-        for mention in mentions:
-            await update_mention(user_id, mention)
+    await db.execute('''
+        INSERT INTO messages (user_id, message, timestamp)
+        VALUES (?, ?, ?)
+    ''', (user_id, message_text, datetime.now()))
+    await db.commit()
 
-    asyncio.create_task(handle_message())
-
-@client.on(events.MessageEdited)
-async def track_edits(event):
-    user_id = event.sender_id
-
-    async def handle_edit():
-        await update_message_edits(user_id)
-
-    asyncio.create_task(handle_edit())
+    stars = await analyze_sentiment(message_text)
+    sentiment_score = (stars / 5) * 100
+    await save_message_sentiment(user_id, event.message.id, sentiment_score)
 
 async def process_message_content(event, message_text, user_id):
     if message_text:
@@ -535,7 +614,6 @@ async def process_message_content(event, message_text, user_id):
             update_message_lengths(user_id, characters)
         )
 
-        # Find all individual emojis in the message text
         emojis = emoji_pattern.findall(message_text)
         for emoji in emojis:
             for individual_emoji in list(emoji):
@@ -543,6 +621,22 @@ async def process_message_content(event, message_text, user_id):
 
     if event.message.is_reply:
         await update_participation(user_id, 0, 0, 0, 1)
+
+
+
+@client.on(events.MessageDeleted)
+async def track_message_deletions(event):
+    logging.debug(f"MessageDeleted event: {event}")
+    for msg_id in event.deleted_ids:
+        async with db.execute('SELECT user_id FROM messages WHERE id = ?', (msg_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                user_id = row[0]
+                logging.debug(f"Deleting message ID {msg_id} belongs to user ID {user_id}")
+                await update_message_deletions(user_id)
+                logging.debug(f"Updated message deletions for user ID {user_id}")
+
+
 
 async def process_media_types(event, user_id):
     if event.message.gif:
@@ -553,11 +647,19 @@ async def process_media_types(event, user_id):
         duration = event.message.video.attributes[0].duration
         await update_video_size(user_id, file_size, duration)
     elif event.message.sticker:
-        await update_media_usage(user_id, 'sticker')
+        if event.message.sticker.mime_type == "application/x-tgsticker":  # Animated sticker
+            await update_media_usage(user_id, 'animated_sticker')
+        else:
+            await update_media_usage(user_id, 'sticker')
     elif event.message.voice:
         await update_media_usage(user_id, 'voice')
         voice_length = event.message.voice.attributes[0].duration
         await update_voice_message_length(user_id, voice_length)
+    elif event.message.audio:
+        await update_media_usage(user_id, 'audio')
+        audio_length = event.message.audio.attributes[0].duration
+        file_size = event.message.file.size if event.message.file else 0
+        await update_audio(user_id, audio_length, file_size)
     elif isinstance(event.message.media, MessageMediaPhoto):
         await update_media_usage(user_id, 'photo')
         file_size = event.message.file.size if event.message.file else 0
@@ -582,17 +684,6 @@ async def raw_update_handler(event):
                     await update_reaction(user_id, reaction_str)
 
         asyncio.create_task(handle_reaction())
-
-@client.on(events.NewMessage(pattern='/start'))
-async def start(event):
-    welcome_message = (
-        "👋 Welcome to the Stats Bot!\n\n"
-        "Use the following commands to interact with the bot:\n"
-        "/stats - Get the latest group statistics\n"
-        "/help - Get help on how to use the bot\n\n"
-        "Enjoy using the bot!"
-    )
-    await event.respond(welcome_message)
 
 @client.on(events.NewMessage(pattern='/stats'))
 async def send_combined_stats(event):
@@ -627,8 +718,8 @@ async def send_combined_stats(event):
 
         # Predict future activity if there's enough data
         if data.shape[0] >= 2:
-            forecast = await train_and_predict(data)
-            forecast_plot = await generate_forecast_plot(forecast)
+            model, forecast = await train_and_predict(data)
+            forecast_plot = await generate_forecast_plot(model, forecast)
             forecast_caption = "📊 Group Activity Forecast for the Next 30 Days 📊"
         else:
             forecast_plot = None
@@ -670,9 +761,6 @@ async def send_combined_stats(event):
     except Exception as e:
         await event.reply(f"Error: {e}")
 
-    except Exception as e:
-        await event.reply(f"Error: {e}")
-
 async def generate_text_summary():
     results = await asyncio.gather(
         format_engagement_leaderboard('daily'),
@@ -686,13 +774,18 @@ async def generate_text_summary():
         format_media_stats('gif'),
         format_media_stats('video'),
         format_media_stats('sticker'),
-        format_emoji_stats()
+        format_media_stats('animated_sticker'),
+        format_media_stats('voice'),
+        format_media_stats('audio'),
+        format_emoji_stats(),
+        format_forward_stats()
     )
 
     (daily_leaderboard, weekly_leaderboard, monthly_leaderboard, active_hours, 
      reaction_leaderboard, popular_reactions, participation_stats, 
      message_length_stats, gif_stats, video_stats, sticker_stats, 
-     emoji_stats) = results
+     animated_sticker_stats, voice_stats, audio_stats, emoji_stats, 
+     forward_stats) = results
 
     message = (
         "📊 **Group Stats** 📊\n\n"
@@ -707,22 +800,23 @@ async def generate_text_summary():
         f"{gif_stats}\n"
         f"{video_stats}\n"
         f"{sticker_stats}\n"
+        f"{animated_sticker_stats}\n"
+        f"{voice_stats}\n"
+        f"{audio_stats}\n"
         f"{emoji_stats}\n"
+        f"{forward_stats}\n"
     )
 
     return message
 
-
 async def get_user_sentiment_scores():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('''
-            SELECT user_id, AVG(sentiment) as avg_sentiment
-            FROM sentiments
-            GROUP BY user_id
-        ''') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('''
+        SELECT user_id, AVG(sentiment) as avg_sentiment
+        FROM sentiments
+        GROUP BY user_id
+    ''') as cursor:
+        rows = await cursor.fetchall()
     return rows
-
 
 async def get_extreme_sentiment_users():
     sentiment_scores = await get_user_sentiment_scores()
@@ -730,7 +824,6 @@ async def get_extreme_sentiment_users():
     if not sentiment_scores:
         return None, None
 
-    # Sort users by sentiment score
     sentiment_scores.sort(key=lambda x: x[1])
 
     most_negative_user = sentiment_scores[0]
@@ -738,21 +831,21 @@ async def get_extreme_sentiment_users():
 
     return most_negative_user, most_positive_user
 
-
-
 async def generate_sentiment_report():
     most_negative_user, most_positive_user = await get_extreme_sentiment_users()
 
     if most_negative_user and most_positive_user:
+        most_negative_name = await get_user_entity(most_negative_user[0])
+        most_positive_name = await get_user_entity(most_positive_user[0])
         report = f"""
 📊 **User Sentiment Report** 📊
 
 🔴 **Most Negative User**:
-- User ID: {most_negative_user[0]}
+- [{most_negative_name.first_name}](tg://user?id={most_negative_user[0]})({most_negative_user[0]})
 - Average Sentiment Score: {most_negative_user[1]:.2f}
 
 🟢 **Most Positive User**:
-- User ID: {most_positive_user[0]}
+- [{most_positive_name.first_name}](tg://user?id={most_positive_user[0]})({most_positive_user[0]})
 - Average Sentiment Score: {most_positive_user[1]:.2f}
 """
     else:
@@ -760,11 +853,9 @@ async def generate_sentiment_report():
 
     return report
 
-
 async def get_general_sentiment():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT sentiment FROM sentiments') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT sentiment FROM sentiments') as cursor:
+        rows = await cursor.fetchall()
     
     if rows:
         sentiments = [row[0] for row in rows]
@@ -774,88 +865,114 @@ async def get_general_sentiment():
 
 async def analyze_sentiment(message_text):
     result = sentiment_analyzer(message_text)
-    # The model returns a label '1 star' to '5 stars'
     label = result[0]['label']
-    stars = int(label[0])  # Extract the number of stars from the label
+    stars = int(label[0])
     return stars
 
+
+async def get_message_type_stats():
+    async with db.execute('SELECT user_id, message_type, count FROM message_types ORDER BY count DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
+    result = "📝 **Message Types Distribution** 📝\n"
+    for rank, (user_id, message_type, count) in enumerate(rows, start=1):
+        user = await get_user_entity(user_id)
+        result += f"{rank}. [{user.first_name}](tg://user?id={user_id})({user_id}) - {count} {message_type} messages\n"
+    return result
+
+
+
+async def get_link_sharing_stats():
+    async with db.execute('SELECT user_id, count FROM link_sharing ORDER BY count DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
+    result = "🔗 **Top 10 Users by Link Sharing** 🔗\n"
+    for rank, (user_id, count) in enumerate(rows, start=1):
+        user = await get_user_entity(user_id)
+        result += f"{rank}. [{user.first_name}](tg://user?id={user_id})({user_id}) - {count} links\n"
+    return result
+
+
+async def get_message_deletion_stats():
+    async with db.execute('SELECT user_id, count FROM message_deletions ORDER BY count DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
+    result = "❌ **Top 10 Users by Message Deletions** ❌\n"
+    for rank, (user_id, count) in enumerate(rows, start=1):
+        user = await get_user_entity(user_id)
+        result += f"{rank}. [{user.first_name}](tg://user?id={user_id})({user_id}) - {count} deletions\n"
+    return result
+
+
 async def calculate_average_edits():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT AVG(edit_count) FROM message_edits') as cursor:
-            average_edits = await cursor.fetchone()
+    async with db.execute('SELECT AVG(edit_count) FROM message_edits') as cursor:
+        average_edits = await cursor.fetchone()
     logging.debug(f"Average message edits calculation result: {average_edits}")
     return average_edits[0] if average_edits and average_edits[0] is not None else 0
 
 async def get_most_active_users():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT user_id, messages FROM participation ORDER BY messages DESC LIMIT 10') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT user_id, messages FROM participation ORDER BY messages DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
     result = "📈 **Top 10 Most Active Users** 📈\n"
     for rank, (user_id, message_count) in enumerate(rows, start=1):
-        result += f"{rank}. [User {user_id}](tg://user?id={user_id}) - {message_count} messages\n"
+        user = await get_user_entity(user_id)
+        result += f"{rank}. [{user.first_name}](tg://user?id={user_id})({user_id}) - {message_count} messages\n"
     return result
 
 async def get_engagement_by_time_of_day():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT hour, SUM(count) as message_count FROM hourly_engagement GROUP BY hour ORDER BY message_count DESC') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT hour, SUM(count) as message_count FROM hourly_engagement GROUP BY hour ORDER BY message_count DESC') as cursor:
+        rows = await cursor.fetchall()
     result = "⏰ **Engagement by Time of Day** ⏰\n"
     for hour, message_count in rows:
         result += f"{hour}:00 - {message_count} messages\n"
     return result
 
 async def get_media_type_distribution():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT media_type, SUM(count) as usage_count FROM media_usage GROUP BY media_type ORDER BY usage_count DESC') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT media_type, SUM(count) as usage_count FROM media_usage GROUP BY media_type ORDER BY usage_count DESC') as cursor:
+        rows = await cursor.fetchall()
     result = "🎥 **Media Type Distribution** 🎥\n"
     for media_type, usage_count in rows:
         result += f"{media_type.capitalize()}: {usage_count} uses\n"
     return result
 
 async def format_engagement_leaderboard(period):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT user_id, count FROM engagement WHERE period = ? ORDER BY count DESC LIMIT 10', (period,)) as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT user_id, count FROM engagement WHERE period = ? ORDER BY count DESC LIMIT 10', (period,)) as cursor:
+        rows = await cursor.fetchall()
     result = f"🏆 **Top 10 Active Users ({period.capitalize()})** 🏆\n"
     for rank, (user_id, count) in enumerate(rows, start=1):
-        result += f"{rank}. [User {user_id}](tg://user?id={user_id}) - {count} messages\n"
+        user = await get_user_entity(user_id)
+        result += f"{rank}. [{user.first_name}](tg://user?id={user_id})({user_id}) - {count} messages\n"
     return result
 
 async def format_active_hours():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT hour, SUM(count) FROM hourly_engagement GROUP BY hour ORDER BY SUM(count) DESC LIMIT 10') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT hour, SUM(count) FROM hourly_engagement GROUP BY hour ORDER BY SUM(count) DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
     result = "⏰ **Top 10 Active Hours** ⏰\n"
     for rank, (hour, count) in enumerate(rows, start=1):
         result += f"{rank}. {hour}:00 - {count} messages\n"
     return result
 
 async def format_reaction_leaderboard():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT user_id, SUM(count) FROM reactions GROUP BY user_id ORDER BY SUM(count) DESC LIMIT 10') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT user_id, SUM(count) FROM reactions GROUP BY user_id ORDER BY SUM(count) DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
     result = "🏆 **Top 10 Users by Reactions Received** 🏆\n"
     for rank, (user_id, count) in enumerate(rows, start=1):
-        result += f"{rank}. [User {user_id}](tg://user?id={user_id}) - {count} reactions\n"
+        user = await get_user_entity(user_id)
+        result += f"{rank}. [{user.first_name}](tg://user?id={user_id})({user_id}) - {count} reactions\n"
     return result
 
 async def format_popular_reactions():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT reaction, SUM(count) FROM reactions GROUP BY reaction ORDER BY SUM(count) DESC LIMIT 10') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT reaction, SUM(count) FROM reactions GROUP BY reaction ORDER BY SUM(count) DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
     result = "🎉 **Top 10 Popular Reactions** 🎉\n"
     for rank, (reaction, count) in enumerate(rows, start=1):
         result += f"{rank}. {reaction} - {count} uses\n"
     return result
 
 async def format_participation_stats():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT user_id, messages, words, characters, replies FROM participation ORDER BY messages DESC LIMIT 10') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT user_id, messages, words, characters, replies FROM participation ORDER BY messages DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
     result = "📈 **Top 10 Participation Stats** 📈\n"
     for rank, (user_id, messages, words, characters, replies) in enumerate(rows, start=1):
-        result += (f"{rank}. [User {user_id}](tg://user?id={user_id}) - "
+        user = await get_user_entity(user_id)
+        result += (f"{rank}. [{user.first_name}](tg://user?id={user_id})({user_id}) - "
                    f"{messages} messages, "
                    f"{words} words, "
                    f"{characters} characters, "
@@ -863,9 +980,8 @@ async def format_participation_stats():
     return result
 
 async def format_message_length_stats():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT user_id, lengths FROM message_lengths') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT user_id, lengths FROM message_lengths') as cursor:
+        rows = await cursor.fetchall()
     sorted_data = sorted(
         ((user_id, sum(json.loads(lengths)) / len(json.loads(lengths)) if json.loads(lengths) else 0) for user_id, lengths in rows),
         key=lambda x: x[1],
@@ -873,38 +989,45 @@ async def format_message_length_stats():
     )[:10]
     result = "📝 **Top 10 Average Message Lengths** 📝\n"
     for rank, (user_id, avg_length) in enumerate(sorted_data, start=1):
-        result += f"{rank}. [User {user_id}](tg://user?id={user_id}) - {avg_length:.2f} characters/message\n"
+        user = await get_user_entity(user_id)
+        result += f"{rank}. [{user.first_name}](tg://user?id={user_id})({user_id}) - {avg_length:.2f} characters/message\n"
     return result
 
 async def format_media_stats(media_type):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT user_id, count FROM media_usage WHERE media_type = ? ORDER BY count DESC LIMIT 10', (media_type,)) as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT user_id, count FROM media_usage WHERE media_type = ? ORDER BY count DESC LIMIT 10', (media_type,)) as cursor:
+        rows = await cursor.fetchall()
     result = f"**{media_type.capitalize()} Stats (Top 10 Users):**\n"
     for user_id, count in rows:
-        result += f" - {user_id}: {count} {media_type}s\n"
+        user = await get_user_entity(user_id)
+        result += f" - [{user.first_name}](tg://user?id={user_id})({user_id}): {count} {media_type}s\n"
     return result
 
 async def format_emoji_stats():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT emoji, count FROM emojis ORDER BY count DESC LIMIT 10') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT emoji, count FROM emojis ORDER BY count DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
     result = "**Emoji Stats (Top 10 Emojis):**\n"
     for emoji, count in rows:
         result += f" - {emoji}: {count} times\n"
     return result
 
+async def format_forward_stats():
+    async with db.execute('SELECT user_id, count FROM forwards ORDER BY count DESC LIMIT 10') as cursor:
+        rows = await cursor.fetchall()
+    result = "📤 **Top 10 Users by Forwards** 📤\n"
+    for rank, (user_id, count) in enumerate(rows, start=1):
+        user = await get_user_entity(user_id)
+        result += f"{rank}. [{user.first_name}](tg://user?id={user_id})({user_id}) - {count} forwards\n"
+    return result
+
 async def calculate_average_voice_length():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT AVG(length) FROM voice_message_lengths') as cursor:
-            result = await cursor.fetchone()
+    async with db.execute('SELECT AVG(length) FROM voice_message_lengths') as cursor:
+        result = await cursor.fetchone()
     logging.debug(f"Average voice length calculation result: {result}")
     return result[0] if result and result[0] is not None else 0
 
 async def calculate_average_photo_size():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT AVG(size) / 1024.0 / 1024.0 AS avg_size_mb, AVG(width) AS avg_width, AVG(height) AS avg_height FROM photo_sizes') as cursor:
-            result = await cursor.fetchone()
+    async with db.execute('SELECT AVG(size) / 1024.0 / 1024.0 AS avg_size_mb, AVG(width) AS avg_width, AVG(height) AS avg_height FROM photo_sizes') as cursor:
+        result = await cursor.fetchone()
     logging.debug(f"Average photo size calculation result: {result}")
     return {
         "avg_size_mb": result[0] if result and result[0] is not None else 0,
@@ -913,56 +1036,48 @@ async def calculate_average_photo_size():
     }
 
 async def calculate_average_video_size_and_duration():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT AVG(size) / 1024.0 / 1024.0 AS avg_size_mb, AVG(duration) AS avg_duration FROM video_sizes') as cursor:
-            result = await cursor.fetchone()
+    async with db.execute('SELECT AVG(size) / 1024.0 / 1024.0 AS avg_size_mb, AVG(duration) AS avg_duration FROM video_sizes') as cursor:
+        result = await cursor.fetchone()
     logging.debug(f"Average video size and duration calculation result: {result}")
     return {
         "avg_size_mb": result[0] if result and result[0] is not None else 0,
         "avg_duration": result[1] if result and result[1] is not None else 0
-
     }
 
-
 async def get_user_participation(user_id):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT messages, words, characters, replies FROM participation WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
+    async with db.execute('SELECT messages, words, characters, replies FROM participation WHERE user_id = ?', (user_id,)) as cursor:
+        row = await cursor.fetchone()
     if row:
         return f"Messages: {row[0]}\nWords: {row[1]}\nCharacters: {row[2]}\nReplies: {row[3]}"
     return "No participation data."
 
 async def get_user_hourly_engagement(user_id):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT hour, count FROM hourly_engagement WHERE user_id = ? ORDER BY hour', (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT hour, count FROM hourly_engagement WHERE user_id = ? ORDER BY hour', (user_id,)) as cursor:
+        rows = await cursor.fetchall()
     result = ""
     for hour, count in rows:
         result += f"{hour}:00 - {count} messages\n"
     return result if result else "No hourly engagement data."
 
 async def get_user_reactions(user_id):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT reaction, count FROM reactions WHERE user_id = ? ORDER BY count DESC', (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT reaction, count FROM reactions WHERE user_id = ? ORDER BY count DESC', (user_id,)) as cursor:
+        rows = await cursor.fetchall()
     result = ""
     for reaction, count in rows:
         result += f"{reaction} - {count} times\n"
     return result if result else "No reaction data."
 
 async def get_user_media_usage(user_id):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT media_type, count FROM media_usage WHERE user_id = ? ORDER BY count DESC', (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT media_type, count FROM media_usage WHERE user_id = ? ORDER BY count DESC', (user_id,)) as cursor:
+        rows = await cursor.fetchall()
     result = ""
     for media_type, count in rows:
         result += f"{media_type.capitalize()}: {count} uses\n"
     return result if result else "No media usage data."
 
 async def get_user_sentiment_analysis(user_id):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT sentiment FROM sentiments WHERE user_id = ?', (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT sentiment FROM sentiments WHERE user_id = ?', (user_id,)) as cursor:
+        rows = await cursor.fetchall()
     
     if rows:
         sentiments = [row[0] for row in rows]
@@ -971,9 +1086,8 @@ async def get_user_sentiment_analysis(user_id):
     return None
 
 async def get_user_message_lengths(user_id):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT lengths FROM message_lengths WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
+    async with db.execute('SELECT lengths FROM message_lengths WHERE user_id = ?', (user_id,)) as cursor:
+        row = await cursor.fetchone()
     if row:
         lengths = json.loads(row[0])
         avg_length = sum(lengths) / len(lengths) if lengths else 0
@@ -981,36 +1095,29 @@ async def get_user_message_lengths(user_id):
     return "No message length data."
 
 async def get_user_message_edits(user_id):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT edit_count FROM message_edits WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
+    async with db.execute('SELECT edit_count FROM message_edits WHERE user_id = ?', (user_id,)) as cursor:
+        row = await cursor.fetchone()
     return f"Message Edits: {row[0]}" if row else "No message edits data."
 
 async def get_user_commands(user_id):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT command, count FROM commands WHERE user_id = ? ORDER BY count DESC', (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT command, count FROM commands WHERE user_id = ? ORDER BY count DESC', (user_id,)) as cursor:
+        rows = await cursor.fetchall()
     result = ""
     for command, count in rows:
         result += f"{command}: {count} times\n"
     return result if result else "No commands data."
 
 async def get_user_mentions(user_id):
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT mention, count FROM mentions WHERE user_id = ? ORDER BY count DESC', (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT mention, count FROM mentions WHERE user_id = ? ORDER BY count DESC', (user_id,)) as cursor:
+        rows = await cursor.fetchall()
     result = ""
     for mention, count in rows:
         result += f"{mention}: {count} times\n"
     return result if result else "No mentions data."
 
-
-
-
 async def fetch_daily_message_counts():
-    async with aiosqlite.connect('stats.db') as db:
-        async with db.execute('SELECT date(timestamp) as date, COUNT(*) as message_count FROM messages GROUP BY date ORDER BY date') as cursor:
-            rows = await cursor.fetchall()
+    async with db.execute('SELECT date(timestamp) as date, COUNT(*) as message_count FROM messages GROUP BY date ORDER BY date') as cursor:
+        rows = await cursor.fetchall()
     return rows
 
 async def prepare_data():
@@ -1025,7 +1132,8 @@ async def train_and_predict(data):
     model.fit(data)
     future = model.make_future_dataframe(periods=30)  # Predict for the next 30 days
     forecast = model.predict(future)
-    return forecast
+    return model, forecast
+
 
 async def generate_forecast_plot(forecast):
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -1039,11 +1147,6 @@ async def generate_forecast_plot(forecast):
     buf.seek(0)
     
     return buf
-
-
-
-
-
 
 async def main():
     await init_db()
